@@ -9,9 +9,15 @@ from io import BytesIO
 import time
 from dotenv import load_dotenv
 from azure.storage.blob import BlobServiceClient
+import logging
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 class DateRange(BaseModel):
@@ -83,18 +89,16 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching data from NetSuite: {e}")
         return {"error": str(e)}
 
 def filter_and_process_data(json_data: dict) -> pd.DataFrame:
-    # Normalize the JSON response to a DataFrame
-    df = pd.json_normalize(json_data['pages'], record_path='data')
+    df = pd.json_normalize(json_data.get('pages', []), record_path='data', errors='ignore')
 
-    # Extract nested values if needed
     for column in df.columns:
         if isinstance(df[column].iloc[0], dict):
             df[column] = df[column].apply(lambda x: extract_value_or_text(x, column, return_value=True))
 
-    # Convert 'lastmodifieddate' to datetime format
     return df
 
 def save_to_blob(csv_data: BytesIO, blob_name: str):
@@ -103,14 +107,13 @@ def save_to_blob(csv_data: BytesIO, blob_name: str):
     blob_client.upload_blob(csv_data, blob_type="BlockBlob", overwrite=True)
 
 def get_chunks(start_date: datetime, end_date: datetime, chunk_size_days: int):
-    """Generate non-overlapping date ranges (chunks) for the given period."""
     chunks = []
     current_start_date = start_date
 
     while current_start_date < end_date:
         current_end_date = min(current_start_date + timedelta(days=chunk_size_days), end_date)
         chunks.append((current_start_date, current_end_date))
-        current_start_date = current_end_date + timedelta(days=1)  # Move to the next chunk
+        current_start_date = current_end_date + timedelta(days=1)
 
     return chunks
 
@@ -120,17 +123,14 @@ async def get_combined_netsuite_data(date_range: DateRange):
     try:
         start_date = datetime.strptime(date_range.start_date, "%m/%d/%Y")
         end_date = datetime.strptime(date_range.end_date, "%m/%d/%Y")
-
-        # Use a single mo_start_date (end_date - 3 days)
         mo_start_date = (end_date - timedelta(days=3)).strftime("%m/%d/%Y")
 
         combined_df = pd.DataFrame()
-
-        # Get non-overlapping chunks for the date range
         chunks = get_chunks(start_date, end_date, chunk_size_days=40)
 
-        # Fetch and process data for Filter 2
+        logger.info(f"Fetching data in chunks for date range {start_date} to {end_date}")
         for current_start_date, current_end_date in chunks:
+            logger.info(f"Processing chunk: {current_start_date} to {current_end_date}")
             json_data_filter2 = fetch_netsuite_data(
                 current_start_date.strftime("%m/%d/%Y"), current_end_date.strftime("%m/%d/%Y"), mo_start_date, filter_type=2)
             if "error" in json_data_filter2:
@@ -139,7 +139,6 @@ async def get_combined_netsuite_data(date_range: DateRange):
             df_filter2 = filter_and_process_data(json_data_filter2)
             combined_df = pd.concat([combined_df, df_filter2], ignore_index=True)
 
-        # Fetch data for Filter 3 (using the same mo_start_date)
         json_data_filter3 = fetch_netsuite_data(
             start_date.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y"), mo_start_date, filter_type=3)
         if "error" in json_data_filter3:
@@ -148,7 +147,6 @@ async def get_combined_netsuite_data(date_range: DateRange):
         df_filter3 = filter_and_process_data(json_data_filter3)
         combined_df = pd.concat([combined_df, df_filter3], ignore_index=True)
 
-        # Drop unnecessary columns for both filters
         columns_to_drop = [
             'values.createdby', 'values.entity', 'values.customer.custentity_dealer_alignment', 'values.item',
             'values.entitystatus', 'values.custbody102', 'values.custbodypm_contact', 'values.salesrep',
@@ -164,19 +162,21 @@ async def get_combined_netsuite_data(date_range: DateRange):
         combined_df.to_csv(output_combined, index=False)
         output_combined.seek(0)
 
-        # Generate blob name with current date and runtime
         end_time = time.time()
         runtime_seconds = round(end_time - start_time, 2)
         current_date = datetime.now().strftime("%m-%d-%Y")
         blob_name_combined = f"netsuite_combined_filtered_data_{current_date}_{{{runtime_seconds}}}.csv"
         save_to_blob(output_combined, blob_name_combined)
 
+        logger.info(f"Combined data saved to Azure Blob Storage as {blob_name_combined} in {runtime_seconds} seconds.")
         return {
             "message": "Combined data saved to Azure Blob Storage successfully",
             "blob_name_combined": blob_name_combined,
             "runtime": runtime_seconds
         }
     except ValueError:
+        logger.error("Invalid date format. Use 'MM/DD/YYYY'.")
         raise HTTPException(status_code=400, detail="Invalid date format. Use 'MM/DD/YYYY'.")
     except Exception as e:
+        logger.exception("An internal server error occurred.")
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
