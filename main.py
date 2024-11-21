@@ -1,30 +1,35 @@
 import os
+import time
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-import requests
-from requests_oauthlib import OAuth1
-import pandas as pd
 from io import BytesIO
 from dotenv import load_dotenv
+import requests
+from requests_oauthlib import OAuth1
 from azure.storage.blob import BlobServiceClient
-import time
+from pandas import json_normalize
 
 # Load environment variables
 load_dotenv()
+
+# Initialize FastAPI and Blob Storage client
 app = FastAPI()
+blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+container_name = "testcontainer"
 
 class DateRange(BaseModel):
     start_date: str
     end_date: str
 
-# Initialize Azure Blob Storage client
-blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
-
-def extract_value_or_text(data: dict, field_name: str, return_value: bool = True):
-    if isinstance(data, dict) and 'value' in data and 'text' in data:
-        return data['value'] if return_value else data['text']
-    return data
+def extract_value_or_text(data, return_value=False):
+    """Extract text or value from nested lists/dictionaries."""
+    if isinstance(data, list) and len(data) > 0:
+        return data[0]['text'] if not return_value else data[0]['value']
+    elif isinstance(data, dict):
+        return data.get('text') if not return_value else data.get('value')
+    return None
 
 def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filter_type: int) -> dict:
     url = "https://452948.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=104&deploy=1"
@@ -38,7 +43,7 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
 
     filters = []
 
-    if filter_type == 2:  # Filter 2: Based on trandate
+    if filter_type == 2:
         filters = [
             [["trandate", "within", start_date, end_date]],
             "AND",
@@ -48,7 +53,7 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
             "AND",
             ["type", "anyof", "CustCred", "Estimate", "SalesOrd", "CustInvc"]
         ]
-    elif filter_type == 3:  # Filter 3: Based on lastmodifieddate
+    elif filter_type == 3:
         filters = [
             [["lastmodifieddate", "within", mo_start_date, end_date]],
             "AND",
@@ -67,14 +72,42 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
             json={
                 "type": "TRANSACTION",
                 "columns": [
-                    {"name": "amount"}, {"name": "closedate"}, {"name": "createdby"}, {"name": "tranid", "join": "createdfrom"},
-                    {"name": "trandate", "join": "createdfrom"}, {"name": "entity"}, {"name": "trandate"}, {"name": "datecreated"},
-                    {"name": "custentity_dealer_alignment", "join": "customer"}, {"name": "custbody57"}, {"name": "custbody_from_cet"},
-                    {"name": "displayname", "join": "item"}, {"name": "item"}, {"name": "rate"}, {"name": "entitystatus"},
-                    {"name": "custbody102"}, {"name": "custbodypm_contact"}, {"name": "tranid"}, {"name": "quantity"},
-                    {"name": "salesrep"}, {"name": "shipcity"}, {"name": "shipcountry"}, {"name": "shipdate"}, {"name": "shipstate"},
-                    {"name": "shipzip"}, {"name": "statusref"}, {"name": "type"}, {"name": "custbody13"}, {"name": "lastmodifieddate"},
-                    {"name": "recordtype"}, {"name": "ordertype"}, {"name": "linesequencenumber"}
+                    {"name": "amount"},
+                    {"name": "closedate"},
+                    {"name": "createdby"},
+                    {"name": "tranid", "join": "createdfrom"},
+                    {"name": "trandate", "join": "createdfrom"},
+                    {"name": "entity"},
+                    {"name": "trandate"},
+                    {"name": "datecreated"},
+                    {"name": "custentity_dealer_alignment", "join": "customer"},
+                    {"name": "custbody57"},
+                    {"name": "custbody_from_cet"},
+                    {"name": "displayname", "join": "item"},
+                    {"name": "item"},
+                    {"name": "rate"},
+                    {"name": "entitystatus"},
+                    {"name": "custbody102"},
+                    {"name": "custbodypm_contact"},
+                    {"name": "tranid"},
+                    {"name": "quantity"},
+                    {"name": "salesrep"},
+                    {"name": "shipcity"},
+                    {"name": "shipcountry"},
+                    {"name": "shipdate"},
+                    {"name": "shipstate"},
+                    {"name": "shipzip"},
+                    {"name": "statusref"},
+                    {"name": "type"},
+                    {"name": "custbody13"},
+                    {"name": "lastmodifieddate"},
+                    {"name": "recordtype"},
+                    {"name": "ordertype"},
+                    {"name": "linesequencenumber"},
+                    {"name": "custitem8", "join": "item"},
+                    {"name": "custitem_esp_item_category", "join": "item"},
+                    {"name": "custitem_esp_item_subcategory", "join": "item"},
+                    {"name": "custitem_esp_cus_item_brand", "join": "item"}
                 ],
                 "filters": filters,
             },
@@ -85,21 +118,33 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
-def filter_and_process_data(json_data: dict) -> pd.DataFrame:
-    # Normalize the JSON response to a DataFrame
-    df = pd.json_normalize(json_data['pages'], record_path='data')
 
-    # Extract nested values if needed
+def filter_and_process_data(json_data: dict) -> pd.DataFrame:
+    """Normalize JSON and process nested data columns."""
+    df = json_normalize(json_data['pages'], record_path='data')
+
     for column in df.columns:
-        if isinstance(df[column].iloc[0], dict):
-            df[column] = df[column].apply(lambda x: extract_value_or_text(x, column, return_value=True))
+        if df[column].notnull().all() and isinstance(df[column].iloc[0], (list, dict)):
+            df[column] = df[column].apply(lambda x: extract_value_or_text(x, return_value=False))
+
+    if 'values.tranid' in df.columns and 'values.linesequencenumber' in df.columns:
+        df['row_number'] = df.groupby(['values.tranid', 'values.linesequencenumber']).cumcount() + 1
+        df = df[df['row_number'] == 1]
+        df.drop(columns=['row_number'], inplace=True, errors='ignore')
 
     return df
 
-def save_to_blob(csv_data: BytesIO, blob_name: str):
-    container_name = "testcontainer"
-    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-    blob_client.upload_blob(csv_data, blob_type="BlockBlob", overwrite=True)
+def upload_to_blob(df: pd.DataFrame, filename: str):
+    """Upload DataFrame as CSV to Azure Blob Storage."""
+    try:
+        csv_data = df.to_csv(index=False)
+        byte_data = BytesIO(csv_data.encode('utf-8'))
+
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=filename)
+        blob_client.upload_blob(byte_data, overwrite=True)
+        print(f"Data uploaded to blob storage: {filename}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading to blob storage: {str(e)}")
 
 def get_chunks(start_date: datetime, end_date: datetime, chunk_size_days: int):
     """Generate non-overlapping date ranges (chunks) for the given period."""
@@ -119,63 +164,34 @@ async def get_combined_netsuite_data(date_range: DateRange):
         start_time = time.time()
         start_date = datetime.strptime(date_range.start_date, "%m/%d/%Y")
         end_date = datetime.strptime(date_range.end_date, "%m/%d/%Y")
-
         mo_start_date = (end_date - timedelta(days=3)).strftime("%m/%d/%Y")
 
         combined_df = pd.DataFrame()
 
+        # Generate chunks
         chunks = get_chunks(start_date, end_date, chunk_size_days=40)
 
-        # Process data in chunks
+        # Fetch and process data in chunks
         for current_start_date, current_end_date in chunks:
-            json_data_filter2 = fetch_netsuite_data(
-                current_start_date.strftime("%m/%d/%Y"), current_end_date.strftime("%m/%d/%Y"), mo_start_date, filter_type=2)
-            if "error" in json_data_filter2:
-                raise HTTPException(status_code=500, detail=json_data_filter2["error"])
+            json_data = fetch_netsuite_data(
+                current_start_date.strftime("%m/%d/%Y"),
+                current_end_date.strftime("%m/%d/%Y"),
+                mo_start_date,
+                filter_type=2
+            )
+            df = filter_and_process_data(json_data)
+            combined_df = pd.concat([combined_df, df], ignore_index=True)
 
-            df_filter2 = filter_and_process_data(json_data_filter2)
-            combined_df = pd.concat([combined_df, df_filter2], ignore_index=True)
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
 
-        # Process the data for Filter 3 (based on `lastmodifieddate`)
-        json_data_filter3 = fetch_netsuite_data(
-            start_date.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y"), mo_start_date, filter_type=3)
-        if "error" in json_data_filter3:
-            raise HTTPException(status_code=500, detail=json_data_filter3["error"])
+        # Generate filename with today's date and runtime enclosed in {}
+        today_date = datetime.now().strftime("%Y%m%d")
+        filename = f"netsuite_data_{today_date}_{{{elapsed_time:.2f}}}.csv"
 
-        df_filter3 = filter_and_process_data(json_data_filter3)
-        combined_df = pd.concat([combined_df, df_filter3], ignore_index=True)
+        # Upload data to blob
+        upload_to_blob(combined_df, filename)
 
-        # Remove unnecessary columns
-        columns_to_drop = [
-            'values.createdby', 'values.entity', 'values.customer.custentity_dealer_alignment', 'values.item',
-            'values.entitystatus', 'values.custbody102', 'values.custbodypm_contact', 'values.salesrep',
-            'values.shipcountry', 'values.statusref', 'values.type', 'values.custbody13'
-        ]
-        combined_df.drop(columns=columns_to_drop, inplace=True, errors='ignore')
-
-        # Filter out any rows with item_new == '-Not Taxable-'
-        if 'values.item_new' in combined_df.columns:
-            combined_df = combined_df[combined_df['values.item_new'] != '-Not Taxable-']
-
-        # Deduplication logic
-        if 'values.tranid' in combined_df.columns and 'values.linesequencenumber' in combined_df.columns:
-            combined_df['row_number'] = combined_df.groupby(['values.tranid', 'values.linesequencenumber']).cumcount() + 1
-            combined_df = combined_df[combined_df['row_number'] == 1]
-            combined_df.drop(columns=['row_number'], inplace=True, errors='ignore')
-
-        # Save to Blob Storage
-        output_combined = BytesIO()
-        combined_df.to_csv(output_combined, index=False)
-        output_combined.seek(0)
-
-        # Calculate runtime and save file to Blob
-        end_time = time.time()
-        runtime_seconds = round(end_time - start_time, 2)
-        current_date = datetime.now().strftime("%m-%d-%Y")
-        blob_name_combined = f"netsuite_combined_filtered_data_{current_date}_{{{runtime_seconds}}}.csv"
-        save_to_blob(output_combined, blob_name_combined)
-
-        return {"message": "Data processed and saved successfully", "runtime_seconds": runtime_seconds}
-
+        return {"message": f"Data processed and uploaded successfully in {elapsed_time:.2f} seconds."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
