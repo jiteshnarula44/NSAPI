@@ -107,17 +107,7 @@ def fetch_netsuite_data(start_date: str, end_date: str, mo_start_date: str, filt
                     {"name": "custitem8", "join": "item"},
                     {"name": "custitem_esp_item_category", "join": "item"},
                     {"name": "custitem_esp_item_subcategory", "join": "item"},
-                    {"name": "custitem_esp_cus_item_brand", "join": "item"},
-                        { "name": "itemid"},
-    { "name": "custitemcustitemesp_option_1"},
-    { "name": "custitemesp_option_1_v"},
-    { "name" : "custitem_esp_option_total"},
-    { "name": "custitemcustitemesp_option_2"},
-    { "name": "custitem_esp_option_2_v"},
-    { "name": "custitem_esp_option_2_total"},
-    { "name": "custitemcustitemesp_option_3"},
-    { "name": "custitem_esp_option_3_v"},
-    { "name": "custitem_esp_option_3_total"}
+                    {"name": "custitem_esp_cus_item_brand", "join": "item"}
                 ],
                 "filters": filters,
             },
